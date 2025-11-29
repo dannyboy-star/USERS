@@ -54,7 +54,6 @@ export class AuthService {
       username,
       passwordHash,
       emailVerificationToken,
-      balance: 0,
       emailVerified: false,
     });
 

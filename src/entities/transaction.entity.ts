@@ -53,6 +53,10 @@ export class Transaction {
   @Index()
   recipientUserId: string;
 
+  // Balance before transaction
+  @Column({ type: 'decimal', precision: 15, scale: 2, nullable: true })
+  balanceBefore: number;
+
   // Balance after transaction
   @Column({ type: 'decimal', precision: 15, scale: 2, nullable: true })
   balanceAfter: number;

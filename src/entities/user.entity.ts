@@ -29,9 +29,6 @@ export class User {
   @Column()
   passwordHash: string;
 
-  @Column({ type: 'decimal', precision: 15, scale: 2, default: 0 })
-  balance: number;
-
   @Column({ default: false })
   emailVerified: boolean;
 

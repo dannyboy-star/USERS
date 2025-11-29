@@ -8,6 +8,7 @@ import { InjectRepository } from '@nestjs/typeorm';
 import { Repository, DataSource } from 'typeorm';
 import { Transaction, TransactionType, TransactionStatus } from '../entities/transaction.entity';
 import { User } from '../entities/user.entity';
+import { Balance } from '../entities/balance.entity';
 import { DepositDto, WithdrawDto, TransferDto } from '../dto/transaction.dto';
 import { EmailService } from './email.service';
 import { AuditService } from './audit.service';
@@ -21,6 +22,8 @@ export class TransactionService {
     private transactionRepository: Repository<Transaction>,
     @InjectRepository(User)
     private userRepository: Repository<User>,
+    @InjectRepository(Balance)
+    private balanceRepository: Repository<Balance>,
     private dataSource: DataSource,
     private emailService: EmailService,
     private auditService: AuditService,
@@ -40,11 +43,14 @@ export class TransactionService {
         throw new NotFoundException('User not found');
       }
 
-      // Update balance atomically
-      const oldBalance = Number(user.balance);
-      const newBalance = oldBalance + Number(amount);
-      user.balance = newBalance;
-      await manager.save(user);
+      // Get current balance from latest balance record
+      const latestBalance = await manager.findOne(Balance, {
+        where: { userId },
+        order: { createdAt: 'DESC' },
+      });
+
+      const balanceBefore = latestBalance ? Number(latestBalance.balanceAfter) : 0;
+      const balanceAfter = balanceBefore + Number(amount);
 
       // Create transaction record
       const transaction = manager.create(Transaction, {
@@ -53,18 +59,30 @@ export class TransactionService {
         amount: Number(amount),
         status: TransactionStatus.COMPLETED,
         description: description || 'Deposit',
-        balanceAfter: newBalance,
+        balanceBefore,
+        balanceAfter,
       });
 
       const savedTransaction = await manager.save(transaction);
 
+      // Create balance record
+      const balance = manager.create(Balance, {
+        userId,
+        transactionId: savedTransaction.id,
+        balanceBefore,
+        balanceAfter,
+        description: description || 'Deposit',
+      });
+
+      await manager.save(balance);
+
       // Audit log
-      this.auditService.logBalanceChange(userId, oldBalance, newBalance, 'Deposit');
+      this.auditService.logBalanceChange(userId, balanceBefore, balanceAfter, 'Deposit');
       this.auditService.logTransaction(userId, savedTransaction.id, 'DEPOSIT', Number(amount));
 
       // Send confirmation email (don't fail transaction if email fails)
       this.emailService
-        .sendTransactionConfirmationEmail(user.email, 'Deposit', Number(amount), newBalance)
+        .sendTransactionConfirmationEmail(user.email, 'Deposit', Number(amount), balanceAfter)
         .catch((error) => {
           this.logger.error('Failed to send deposit confirmation email', error);
         });
@@ -87,18 +105,21 @@ export class TransactionService {
         throw new NotFoundException('User not found');
       }
 
-      const currentBalance = Number(user.balance);
+      // Get current balance from latest balance record
+      const latestBalance = await manager.findOne(Balance, {
+        where: { userId },
+        order: { createdAt: 'DESC' },
+      });
+
+      const balanceBefore = latestBalance ? Number(latestBalance.balanceAfter) : 0;
       const withdrawalAmount = Number(amount);
 
       // Check sufficient balance
-      if (currentBalance < withdrawalAmount) {
+      if (balanceBefore < withdrawalAmount) {
         throw new BadRequestException('Insufficient funds');
       }
 
-      // Update balance atomically
-      const newBalance = currentBalance - withdrawalAmount;
-      user.balance = newBalance;
-      await manager.save(user);
+      const balanceAfter = balanceBefore - withdrawalAmount;
 
       // Create transaction record
       const transaction = manager.create(Transaction, {
@@ -107,18 +128,30 @@ export class TransactionService {
         amount: withdrawalAmount,
         status: TransactionStatus.COMPLETED,
         description: description || 'Withdrawal',
-        balanceAfter: newBalance,
+        balanceBefore,
+        balanceAfter,
       });
 
       const savedTransaction = await manager.save(transaction);
 
+      // Create balance record
+      const balance = manager.create(Balance, {
+        userId,
+        transactionId: savedTransaction.id,
+        balanceBefore,
+        balanceAfter,
+        description: description || 'Withdrawal',
+      });
+
+      await manager.save(balance);
+
       // Audit log
-      this.auditService.logBalanceChange(userId, currentBalance, newBalance, 'Withdrawal');
+      this.auditService.logBalanceChange(userId, balanceBefore, balanceAfter, 'Withdrawal');
       this.auditService.logTransaction(userId, savedTransaction.id, 'WITHDRAWAL', withdrawalAmount);
 
       // Send confirmation email
       this.emailService
-        .sendTransactionConfirmationEmail(user.email, 'Withdrawal', withdrawalAmount, newBalance)
+        .sendTransactionConfirmationEmail(user.email, 'Withdrawal', withdrawalAmount, balanceAfter)
         .catch((error) => {
           this.logger.error('Failed to send withdrawal confirmation email', error);
         });
@@ -164,22 +197,29 @@ export class TransactionService {
       }
 
       const transferAmount = Number(amount);
-      const senderBalance = Number(sender.balance);
+
+      // Get current balances for both users
+      const senderLatestBalance = await manager.findOne(Balance, {
+        where: { userId },
+        order: { createdAt: 'DESC' },
+      });
+
+      const recipientLatestBalance = await manager.findOne(Balance, {
+        where: { userId: recipient.id },
+        order: { createdAt: 'DESC' },
+      });
+
+      const senderBalanceBefore = senderLatestBalance ? Number(senderLatestBalance.balanceAfter) : 0;
+      const recipientBalanceBefore = recipientLatestBalance ? Number(recipientLatestBalance.balanceAfter) : 0;
 
       // Check sufficient balance
-      if (senderBalance < transferAmount) {
+      if (senderBalanceBefore < transferAmount) {
         throw new BadRequestException('Insufficient funds');
       }
 
-      // Update both balances atomically
-      const senderNewBalance = senderBalance - transferAmount;
-      const recipientNewBalance = Number(recipientLocked.balance) + transferAmount;
-
-      sender.balance = senderNewBalance;
-      recipientLocked.balance = recipientNewBalance;
-
-      await manager.save(sender);
-      await manager.save(recipientLocked);
+      // Calculate new balances
+      const senderBalanceAfter = senderBalanceBefore - transferAmount;
+      const recipientBalanceAfter = recipientBalanceBefore + transferAmount;
 
       // Create transaction record for sender
       const transaction = manager.create(Transaction, {
@@ -189,13 +229,25 @@ export class TransactionService {
         status: TransactionStatus.COMPLETED,
         description: description || `Transfer to ${recipientEmail}`,
         recipientUserId: recipient.id,
-        balanceAfter: senderNewBalance,
+        balanceBefore: senderBalanceBefore,
+        balanceAfter: senderBalanceAfter,
       });
 
       const savedTransaction = await manager.save(transaction);
 
+      // Create balance record for sender
+      const senderBalance = manager.create(Balance, {
+        userId,
+        transactionId: savedTransaction.id,
+        balanceBefore: senderBalanceBefore,
+        balanceAfter: senderBalanceAfter,
+        description: description || `Transfer to ${recipientEmail}`,
+      });
+
+      await manager.save(senderBalance);
+
       // Audit log
-      this.auditService.logBalanceChange(userId, senderBalance, senderNewBalance, 'Transfer');
+      this.auditService.logBalanceChange(userId, senderBalanceBefore, senderBalanceAfter, 'Transfer');
       this.auditService.logTransaction(userId, savedTransaction.id, 'TRANSFER', transferAmount);
 
       // Create transaction record for recipient
@@ -206,14 +258,26 @@ export class TransactionService {
         status: TransactionStatus.COMPLETED,
         description: description || `Transfer from ${sender.email}`,
         recipientUserId: userId,
-        balanceAfter: recipientNewBalance,
+        balanceBefore: recipientBalanceBefore,
+        balanceAfter: recipientBalanceAfter,
       });
 
-      await manager.save(recipientTransaction);
+      const savedRecipientTransaction = await manager.save(recipientTransaction);
+
+      // Create balance record for recipient
+      const recipientBalance = manager.create(Balance, {
+        userId: recipient.id,
+        transactionId: savedRecipientTransaction.id,
+        balanceBefore: recipientBalanceBefore,
+        balanceAfter: recipientBalanceAfter,
+        description: description || `Transfer from ${sender.email}`,
+      });
+
+      await manager.save(recipientBalance);
 
       // Send confirmation emails
       this.emailService
-        .sendTransactionConfirmationEmail(sender.email, 'Transfer', transferAmount, senderNewBalance)
+        .sendTransactionConfirmationEmail(sender.email, 'Transfer', transferAmount, senderBalanceAfter)
         .catch((error) => {
           this.logger.error('Failed to send transfer confirmation email to sender', error);
         });
@@ -223,7 +287,7 @@ export class TransactionService {
           recipient.email,
           'Transfer Received',
           transferAmount,
-          recipientNewBalance,
+          recipientBalanceAfter,
         )
         .catch((error) => {
           this.logger.error('Failed to send transfer confirmation email to recipient', error);
